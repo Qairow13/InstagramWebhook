@@ -31,7 +31,6 @@ def extract_messages(payload: dict) -> List[Tuple[str, str]]:
     """
     out: List[Tuple[str, str]] = []
 
-    # Вариант 1: entry[].changes[].value.messages[]
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
             value = change.get("value", {}) or {}
@@ -47,7 +46,6 @@ def extract_messages(payload: dict) -> List[Tuple[str, str]]:
                 if sender and text:
                     out.append((sender, text))
 
-    # Вариант 2: entry[].messaging[] (иногда встречается)
     for entry in payload.get("entry", []):
         for msg in entry.get("messaging", []) or []:
             sender = (msg.get("sender") or {}).get("id")
@@ -101,7 +99,7 @@ def send_ig_text(recipient_id: str, text: str) -> None:
     Отправка сообщения обратно в IG Direct.
     """
     if not PAGE_TOKEN or not IG_USER_ID:
-        log.error("PAGE_TOKEN/IG_USER_ID отсутствуют. Проверьте переменные окружения.")
+        log.error("PAGE_TOKEN/IG_USER_ID отсутствуют. Проверь переменные окружения.")
         return
 
     url = f"{GRAPH_BASE}/{IG_USER_ID}/messages"
@@ -109,14 +107,17 @@ def send_ig_text(recipient_id: str, text: str) -> None:
     data = {
         "recipient": {"id": recipient_id},
         "message": {"text": text},
-        "messaging_type": "RESPONSE",  # стандартный тип ответа
+        "messaging_type": "RESPONSE",
     }
+
+    log.info("➡️ SEND TO IG: %s %s", recipient_id, text)
 
     try:
         r = requests.post(url, params=params, json=data, timeout=20)
         log.info("SEND IG STATUS %s: %s", r.status_code, r.text)
     except Exception as e:
-        log.exception("SEND IG ERROR: %s", getattr(e, "message", e))
+        log.exception("SEND IG ERROR: %s", e)
+
 
 
 # ------------------ Роуты ------------------
@@ -168,3 +169,4 @@ async def webhook_event(request: Request):
             log.exception("Handle error for sender %s: %s", sender_id, e)
 
     return {"status": "ok"}
+
