@@ -1,220 +1,137 @@
 import os
 import json
 import logging
-from typing import List, Tuple, Optional
+from typing import Any, Dict
 
 import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 
-# ---------------- НАСТРОЙКИ ----------------
-
+# ----------------- НАСТРОЙКА ЛОГГЕРА -----------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ig-webhook")
 
-VERIFY_TOKEN   = (os.getenv("VERIFY_TOKEN", "apiapimeta") or "").strip()
-PAGE_TOKEN     = (os.getenv("PAGE_TOKEN", "") or "").strip()
-IG_USER_ID     = (os.getenv("IG_USER_ID", "") or "").strip()
-GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY", "") or "").strip()
-SYSTEM_PROMPT  = (os.getenv("SYSTEM_PROMPT", "Ты консультант. Отвечай кратко и по делу.") or "").strip()
+# ----------------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ -----------------
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "apiapimeta")
+PAGE_TOKEN = os.getenv("PAGE_TOKEN", "")      # свежий токен страницы!
+IG_USER_ID = os.getenv("IG_USER_ID", "")      # id бизнес-аккаунта Instagram
 
-GRAPH_BASE = "https://graph.facebook.com/v20.0"
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
+if not PAGE_TOKEN:
+    log.warning("⚠ PAGE_TOKEN не задан! Ответы в Instagram работать не будут.")
+if not IG_USER_ID:
+    log.warning("⚠ IG_USER_ID не задан! Ответы в Instagram работать не будут.")
 
-# ВАЖНО: app создаём СРАЗУ, ДО декораторов
-app = FastAPI(title="IG Webhook Bot", version="1.0.0")
-
-# ---------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------------
-
-
-def fetch_message_by_mid(mid: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    По message_id (mid) тянем текст и id отправителя из Graph API.
-    Возвращаем (sender_id, text) или (None, None), если не получилось.
-    """
-    if not PAGE_TOKEN:
-        log.error("PAGE_TOKEN пустой, не могу сходить за текстом сообщения.")
-        return None, None
-
-    url = f"{GRAPH_BASE}/{mid}"
-    params = {
-        "access_token": PAGE_TOKEN,
-        "fields": "message,from,to"
-    }
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        log.info("GET MESSAGE BY MID %s -> %s %s", mid, r.status_code, r.text)
-        if r.status_code != 200:
-            return None, None
-
-        data = r.json()
-        text = (data.get("message") or "").strip()
-        sender = (data.get("from") or {}).get("id")
-        if not sender or not text:
-            return None, None
-        return sender, text
-    except Exception as e:
-        log.exception("Ошибка при fetch_message_by_mid: %s", e)
-        return None, None
-
-
-def extract_messages(payload: dict) -> List[Tuple[str, str]]:
-    """
-    Достаём пары (sender_id, text) из payload Instagram.
-    Поддерживаем:
-    - entry[].messaging[].message.text
-    - entry[].messaging[].message_edit.mid (через отдельный запрос)
-    - entry[].changes[].value.messages[] (старый формат)
-    """
-    out: List[Tuple[str, str]] = []
-
-    # 1) Новый формат от IG (через Messenger API): entry[].messaging[]
-    for entry in payload.get("entry", []) or []:
-        for m in entry.get("messaging", []) or []:
-            # Обычное входящее сообщение
-            if "message" in m and isinstance(m["message"], dict):
-                msg = m["message"]
-                text = (msg.get("text") or "").strip()
-                sender = (m.get("sender") or {}).get("id")
-                if sender and text:
-                    out.append((sender, text))
-
-            # Событие message_edit (как в твоём логе)
-            elif "message_edit" in m and isinstance(m["message_edit"], dict):
-                mid = m["message_edit"].get("mid")
-                if mid:
-                    sender, text = fetch_message_by_mid(mid)
-                    if sender and text:
-                        out.append((sender, text))
-
-    # 2) Старый формат: entry[].changes[].value.messages[]
-    for entry in payload.get("entry", []) or []:
-        for change in entry.get("changes", []) or []:
-            value = change.get("value") or {}
-            for msg in value.get("messages", []) or []:
-                sender = (msg.get("from") or {}).get("id") or (value.get("from") or {}).get("id")
-                text = ""
-                if isinstance(msg.get("text"), dict):
-                    text = (msg["text"].get("body") or "").strip()
-                else:
-                    text = (msg.get("text") or "").strip()
-                if sender and text:
-                    out.append((sender, text))
-
-    return out
-
-
-def gemini_reply(user_text: str) -> str:
-    """
-    Вызов Gemini (Google AI Studio).
-    """
-    if not GEMINI_API_KEY:
-        return "Извините, мой ИИ-ключ не настроен."
-
-    try:
-        payload = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {"text": f"{SYSTEM_PROMPT}\n\nВопрос клиента: {user_text}"}
-                    ],
-                }
-            ]
-        }
-        r = requests.post(
-            GEMINI_URL,
-            params={"key": GEMINI_API_KEY},
-            json=payload,
-            timeout=20,
-        )
-        r.raise_for_status()
-        data = r.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception as e:
-        log.exception("Gemini error: %s", e)
-        return "Извините, сейчас не могу ответить. Напишите, пожалуйста, позже."
-
-
-def send_ig_text(recipient_id: str, text: str) -> None:
-    """
-    Отправка сообщения обратно в IG Direct.
-    """
-    if not PAGE_TOKEN or not IG_USER_ID:
-        log.error("PAGE_TOKEN/IG_USER_ID отсутствуют. Проверь переменные окружения.")
-        return
-
-    url = f"{GRAPH_BASE}/{IG_USER_ID}/messages"
-    params = {"access_token": PAGE_TOKEN}
-    data = {
-        "recipient": {"id": recipient_id},
-        "message": {"text": text},
-        "messaging_type": "RESPONSE",
-    }
-
-    log.info("➡️ SEND TO IG: %s %s", recipient_id, text)
-
-    try:
-        r = requests.post(url, params=params, json=data, timeout=20)
-        log.info("SEND IG STATUS %s: %s", r.status_code, r.text)
-    except Exception as e:
-        log.exception("SEND IG ERROR: %s", e)
-
-
-# ---------------- РОУТЫ ----------------
+# ----------------- FASTAPI ПРИЛОЖЕНИЕ -----------------
+app = FastAPI()
 
 
 @app.get("/")
-def health():
-    return {"ok": True, "service": "IG webhook", "verify_token": VERIFY_TOKEN}
+def home():
+    """Простой health-check."""
+    return {
+        "ok": True,
+        "service": "Instagram webhook",
+        "message": "Сервис работает. /webhook используется для Instagram."
+    }
 
 
+# ----------------- ВЕБХУК: ПОДТВЕРЖДЕНИЕ -----------------
 @app.get("/webhook")
 async def verify_webhook(request: Request):
     """
-    Проверка URL от Meta.
-    Должны вернуть hub.challenge как text/plain при корректном маркере.
+    Meta (Facebook) вызывает этот GET, когда ты настраиваешь Webhook.
+    Мы должны вернуть hub.challenge, если hub.verify_token совпадает.
     """
-    p = request.query_params
-    mode = (p.get("hub.mode") or "").strip()
-    token = (p.get("hub.verify_token") or "").strip()
-    challenge = p.get("hub.challenge")
+    params = request.query_params
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
 
     log.info("VERIFY -> mode=%s token=%s", mode, token)
 
     if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
-        return PlainTextResponse(str(challenge))
+        return PlainTextResponse(challenge)
+
     return PlainTextResponse("forbidden", status_code=403)
 
 
+# ----------------- ФУНКЦИЯ ОТВЕТА В INSTAGRAM -----------------
+def send_ig_message(recipient_id: str, text: str) -> None:
+    """
+    Отправляем ответ в директ Instagram.
+    recipient_id — IG_USER_ID пользователя (того, кто написал боту).
+    """
+    if not PAGE_TOKEN or not IG_USER_ID:
+        log.warning("❌ Нет PAGE_TOKEN или IG_USER_ID — не могу отправить сообщение.")
+        return
+
+    url = f"https://graph.facebook.com/v24.0/{IG_USER_ID}/messages"
+    params = {"access_token": PAGE_TOKEN}
+    payload = {
+        "messaging_product": "instagram",
+        "recipient": {"id": recipient_id},
+        "message": {"text": text},
+    }
+
+    log.info("➡️ SEND TO IG: %s %s", recipient_id, text)
+    resp = requests.post(url, params=params, json=payload)
+
+    try:
+        resp.raise_for_status()
+        log.info("✅ IG SEND STATUS %s: %s", resp.status_code, resp.text)
+    except requests.HTTPError:
+        log.error("❌ IG SEND STATUS %s: %s", resp.status_code, resp.text)
+
+
+# ----------------- ВРЕМЕННАЯ ФУНКЦИЯ “AI” -----------------
+def ask_ai_stub(user_text: str) -> str:
+    """
+    Вместо настоящего Gemini — просто простейший ответ.
+    Когда починим Gemini, заменим эту функцию.
+    """
+    return f"Ты написал(а): {user_text}"
+
+
+# ----------------- ВЕБХУК: ОСНОВНОЙ POST -----------------
 @app.post("/webhook")
 async def webhook_event(request: Request):
     """
-    Основной вход: Instagram шлёт сюда события.
-    Достаём входящие сообщения, генерим ответ (Gemini) и отправляем в Direct.
+    Meta присылает сюда события:
+    - новые сообщения
+    - редактирование сообщений
+    и т.д.
     """
+    raw_body = await request.body()
+    log.info("RAW BODY: %s", raw_body.decode("utf-8", errors="ignore"))
+
+    # Парсим JSON
     try:
-        raw = await request.body()
-        raw_text = raw.decode("utf-8", errors="ignore")
-        log.info("RAW BODY: %s", raw_text)
-        body = json.loads(raw_text or "{}")
-    except Exception:
-        log.exception("Invalid JSON!")
+        data: Dict[str, Any] = json.loads(raw_body.decode("utf-8"))
+    except json.JSONDecodeError:
+        log.error("Invalid JSON: %s", raw_body)
         return JSONResponse({"status": "bad json"}, status_code=400)
 
-    log.info("📩 incoming: %s", json.dumps(body, ensure_ascii=False))
+    log.info("📩 incoming: %s", json.dumps(data, ensure_ascii=False))
 
-    pairs = extract_messages(body)
-    if not pairs:
-        # Ничего полезного (например, служебное событие)
-        return {"status": "ignored"}
+    # Разбираем структуру Instagram webhook
+    for entry in data.get("entry", []):
+        messaging_events = entry.get("messaging") or []
 
-    for sender_id, text in pairs:
-        try:
-            reply = gemini_reply(text)
-            send_ig_text(sender_id, reply)
-        except Exception as e:
-            log.exception("Ошибка обработки сообщения от %s: %s", sender_id, e)
+        for event in messaging_events:
+            sender_id = event.get("sender", {}).get("id")
+            message = event.get("message")
+
+            # Нас интересуют только обычные сообщения с текстом
+            if sender_id and message and "text" in message:
+                user_text = message["text"]
+                log.info("Получено сообщение от %s: %s", sender_id, user_text)
+
+                # ВРЕМЕННЫЙ AI
+                reply_text = ask_ai_stub(user_text)
+
+                # Отправляем ответ
+                send_ig_message(sender_id, reply_text)
 
     return {"status": "ok"}
+
 
